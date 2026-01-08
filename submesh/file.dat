@@ -1,0 +1,10 @@
+ 1
+53k_test
+53K.14
+
+---------+---------+---------+---------+---------+---------+---------+---------+---------+---------+
+ L1 : Input file parameter ( 0:Only Grid, 1:Grid+fort.13 )
+ L2 : Project_name         (Output sub-grid name will be "Project_name-sub.grd")
+ L3 : Original grid fort.14
+ L4 : Original fort.13 ( Optional, if you input "1" at L1 )
+
