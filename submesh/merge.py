@@ -20,6 +20,39 @@ from submesh.io import write_fort14
 import time
 from pathlib import Path
 from collections import Counter
+from numba import njit
+
+
+@njit
+def mark_boundaries(nblg, nblncg, nbl, nblnc, npline):
+    global_edges = set()
+    for i in range(nblg):
+        a = nblncg[0, i]
+        b = nblncg[1, i]
+        global_edges.add((min(a,b), max(a,b)))
+
+    for i in range(nbl):
+        a = nblnc[0, i]
+        b = nblnc[1, i]
+        if (min(a,b), max(a,b)) in global_edges:
+            npline[i] = 0
+    return npline, global_edges
+
+from collections import defaultdict
+
+def boundary_nodes_fortran_df(df):
+    nprops = defaultdict(int)
+    tris = df[["node_1", "node_2", "node_3"]]
+
+    for a, b, c in tris.itertuples(index=False):
+        nprops[a] += b - c
+        nprops[b] += c - a
+        nprops[c] += a - b
+
+    nbn_max = sum(1 for v in nprops.values() if v != 0)
+    
+    return nbn_max, nprops
+
 
 def merge_domain(submesh, full_mesh, path='.', file_header='grid'):
     """Merge a refined submesh back into the full mesh.
@@ -42,116 +75,205 @@ def merge_domain(submesh, full_mesh, path='.', file_header='grid'):
     print(f"Mesh size: {num_nodes:,} nodes, {num_elements:,} elements\n")
 
     # Step 1: Find boundary of entire global grid
-    t0 = time.time()
     print("[Step 1/10] Finding global grid boundary (netable=all 1s)...")
+    nbn_max, nprop1 = boundary_nodes_fortran_df(full_mesh.elements)
+    nbn_max = 20
+    t0 = time.time()
     netable = np.ones(num_elements, dtype=np.int32)
-    nblg, nblncg = mkeline(len(full_mesh.nodes),
-                         len(full_mesh.elements), full_mesh.elements, netable)
+    nblg, nblncg = mkeline(num_nodes, num_elements, full_mesh.elements, netable, nbn_max)
     print(f"            Found {nblg:,} global boundary edges ({time.time()-t0:.1f}s)\n")
 
     # Step 2: Read netable from element mask file
+    # Reads the elements from the global grid which are contained 
+    # in the subgrid (True) or not (False)
     t0 = time.time()
     element_mask_path = Path(path) / 'element_mask.csv'
     print(f"[Step 2/10] Reading element mask from {element_mask_path}...")
     element_mask_df = pd.read_csv(element_mask_path, index_col=0)
     netable = element_mask_df['in_subgrid'].astype(np.int32).values
-    n_subgrid = int(np.sum(netable))
-    print(f"            {n_subgrid:,} elements in subgrid region ({time.time()-t0:.1f}s)\n")
+    nptable = [0] * (num_nodes + 1)
+    nprops = np.zeros(num_elements + 1)
+    for m, elem in full_mesh.elements.iterrows():
+        if netable[m-1] == 1:
+            a = elem['node_1']
+            b = elem['node_2']
+            c = elem['node_3']
+            nptable[a -1] = 1
+            nptable[b- 1] = 1
+            nptable[c -1] = 1
+            nprops[a] += b - c
+            nprops[b] += c - a
+            nprops[c] += a - b
+
+    nbn_max = 20
+    for i in range(num_nodes):
+        if nprops[i] !=0:
+            nbn_max += 1
+    print('After Step 2 checking for nptalbe===1', np.sum(nptable), np.where(np.array(nptable) == 1))
+   
+    # n_subgrid = int(np.sum(netable))
+    # print(f"            {n_subgrid:,} elements in subgrid region ({time.time()-t0:.1f}s)\n")
 
     # Step 3: Find boundary around subgrid
     t0 = time.time()
     print("[Step 3/10] Finding subgrid boundary edges...")
-    print(f"DEBUG::::::: {len(netable)}")
-    nbl, nblnc = mkeline(len(submesh.nodes), len(submesh.elements), submesh.elements, netable)
+    
+    nbl, nblnc = mkeline(num_nodes, num_elements, full_mesh.elements, netable, nbn_max)
     print(f"            Found {nbl:,} subgrid boundary edges ({time.time()-t0:.1f}s)\n")
     # Step 4: Compare boundary edges and mark differences
     t0 = time.time()
     print("[Step 4/10] Comparing global vs subgrid boundaries...")
     # Create set of global boundary edges for O(1) lookup
-    global_edge_set = set()
-    print(f'DEBUG:::::::: {nblg}, {nblncg}')
-    for n in range(nblg):
-        n1 = nblncg[0, n]
-        n2 = nblncg[1, n]
-        global_edge_set.add((n1, n2))
-
     npline = np.ones(nbl)
+    print(f'nblncg: {nblncg.shape}, nblnc {nblnc}, nbl {nbl}')
+
+    # npline, edge_lookup = mark_boundaries(nblg, nblncg, nbl, nblnc, npline)
     for m in range(nbl):
         m1 = nblnc[0, m]
         m2 = nblnc[1, m]
-        if (m1, m2) in global_edge_set or (m2, m1) in global_edge_set:
-            npline[m] = 0
-    print(f"            Marked boundary differences ({time.time()-t0:.1f}s)\n")
+        for n in range(nblg):
+            n1 = nblncg[0, n]
+            n2 = nblncg[1,n]
+            if (m1==n1) and (n2==m2):
+                npline[m] = 0
+                break
+    for segments in full_mesh.boundaries.values():
+        for segment in segments:
+            ibtype = segment.ibtype
+            if (ibtype !=4) and (ibtype!=24):
+                continue
+            nodes = segment.nodes
+            nvell = len(nodes)
+            for j in range(1, nvell+1):
+                n1 = nodes[j-1].node_id
+                n2 = nodes[j].node_id
+                l1 = nodes[j-1].connected_to or n1
+                l2 = nodes[j].connected_to or n2
+                
+                nchk = 0
+                for m in range(1, nbl+1):
+                    m1 = nblnc[1][m]
+                    m2 = nblnc[2][m]
+                    if (m1==n1 and m2 == n2) or (m1 == n2 and m2==n1):
+                        nchk = m
+                        break
+                lchk = 0
+                for m in range(1, nbl+1):
+                    m1 = nblnc[1][m]
+                    m2 = nblnc[2][m]
+                    if (m1==l1 and m2==l2) or (m1==l2 and m2==l1):
+                        lchk = m
+                        break
+                if (nchk * lchk == 0) and (nchk + lchk != 0):
+                    npline[nchk + lchk] = 1
+    
+    
+    # global_edge_set = set()
+    # print(f'DEBUG:::::::: {nblg}, {nblncg}')
+    # for n in range(nblg):
+    #     n1 = nblncg[0, n]
+    #     n2 = nblncg[1, n]
+    #     global_edge_set.add((n1, n2))
 
-    # Step 5: Build edge lookup and handle connected boundaries
-    t0 = time.time()
-    print("[Step 5/10] Processing connected boundaries...")
-    # Build edge lookup dictionary once for O(1) lookups
-    edge_lookup = {}
-    for m in range(nbl):
-        m1 = nblnc[0, m]
-        m2 = nblnc[1, m]
-        edge_lookup[(m1, m2)] = m
-        edge_lookup[(m2, m1)] = m  # Both directions
+    # # Step 5: Build edge lookup and handle connected boundaries
+    # # Build edge lookup dictionary once for O(1) lookups   
+    # npline = np.ones(nbl)
+    # edge_lookup = {}
+    # for m in range(nbl):
+    #     m1 = nblnc[0, m]
+    #     m2 = nblnc[1, m]
+    #     edge_lookup[(m1, m2)] = m
+    #     edge_lookup[(m2, m1)] = m  # Both directions
+    #     if (m1, m2) in global_edge_set or (m2, m1) in global_edge_set:
+    #         npline[m] = 0
+    # print(f"            Marked boundary differences ({time.time()-t0:.1f}s)\n")
 
-    n_connected_segs = sum(1 for seg in full_mesh.boundaries['land']
-                          if seg.ibtype in IBTYPE_CONNECTED)
-    for segment in full_mesh.boundaries['land']:
-        if segment.ibtype not in IBTYPE_CONNECTED:
+    nbd = int(np.sum(npline))
+    nbdnc = np.zeros((2, nbd))
+    nbd = 0
+    for n in range(nbl):
+        if(npline[n] == 0):
             continue
-        # Check consecutive node pairs along this boundary
-        for j in range(len(segment.nodes) -1):
-            node_current = segment.nodes[j]
-            node_next = segment.nodes[j + 1]
-            n1 = node_current.node_id
-            n2 = node_next.node_id
-            l1 = node_current.connected_to
-            l2 = node_next.connected_to
+        
+        for i in range(2):
+            nbdnc[i, nbd] = nblnc[i,n]
+        nbd += 1
+   
 
-            # check if edge(n1, n2) is in the subgrid boundary edges (O(1) lookup)
-            nchk = edge_lookup.get((n1, n2), -1)
-            lchk = edge_lookup.get((l1, l2), -1)
+    nprops = np.zeros(len(submesh.elements) + 1)
+    for m, elem in submesh.elements.iterrows():
+        a = elem['node_1']
+        b = elem['node_2']
+        c = elem['node_3']
+        nprops[a] += b - c
+        nprops[b] += c - a
+        nprops[c] += a - b
 
-            if (nchk * lchk == -1) and (nchk + lchk != -1):
+    nbns_max = 20
+    for i in range(len(submesh.nodes)):
+        if nprops[i] !=0:
+            nbns_max += 1
+    mmaps = np.ones(len(submesh.elements))
+    nbls, nblncs = mkeline(len(submesh.nodes), len(submesh.elements), submesh.elements, mmaps, nbns_max)
+    
+    # n_connected_segs = sum(1 for seg in full_mesh.boundaries['land']
+    #                       if seg.ibtype in IBTYPE_CONNECTED)
+    # for segment in full_mesh.boundaries['land']:
+    #     if segment.ibtype not in IBTYPE_CONNECTED:
+    #         continue
+    #     # Check consecutive node pairs along this boundary
+    #     for j in range(len(segment.nodes) -1):
+    #         node_current = segment.nodes[j]
+    #         node_next = segment.nodes[j + 1]
+    #         n1 = node_current.node_id
+    #         n2 = node_next.node_id
+    #         l1 = node_current.connected_to
+    #         l2 = node_next.connected_to
 
-                idx = nchk if nchk != -1 else lchk
-                npline[idx] = 1
+    #         # check if edge(n1, n2) is in the subgrid boundary edges (O(1) lookup)
+    #         nchk = edge_lookup.get((n1, n2), -1)
+    #         lchk = edge_lookup.get((l1, l2), -1)
 
-    print(f"            Processed {n_connected_segs} connected boundary segments ({time.time()-t0:.1f}s)\n")
+    #         if (nchk * lchk == -1) and (nchk + lchk != -1):
+
+    #             idx = nchk if nchk != -1 else lchk
+    #             npline[idx] = 1
+
+    # print(f"            Processed {n_connected_segs} connected boundary segments ({time.time()-t0:.1f}s)\n")
     # Step 6: Create final boundary edge array
     t0 = time.time()
     print("[Step 6/10] Creating final boundary edge array...")
-    nbd = int(np.sum(npline))
-    nbdnc = np.zeros((2, nbd), dtype=np.int32)
-    nbd_counter = 0
-    for n in range(nbl):
-        if npline[n] == 0:
-            continue
-        nbdnc[0, nbd_counter] = nblnc[0, n]
-        nbdnc[1, nbd_counter] = nblnc[1,n]
-        nbd_counter += 1
-    print(f"            Created {nbd:,} boundary edges ({time.time()-t0:.1f}s)\n")
-    print(f"            Created {nbd:,} boundary edges ({time.time()-t0:.1f}s)\n")
+    # nbd = int(np.sum(npline))
+    # nbdnc = np.zeros((2, nbd), dtype=np.int32)
+    # nbd_counter = 0
+    # for n in range(nbl):
+    #     if npline[n] == 0:
+    #         continue
+    #     nbdnc[0, nbd_counter] = nblnc[0, n]
+    #     nbdnc[1, nbd_counter] = nblnc[1,n]
+    #     nbd_counter += 1
+    # print(f"            Created {nbd:,} boundary edges ({time.time()-t0:.1f}s)\n")
+    # print(f"            Created {nbd:,} boundary edges ({time.time()-t0:.1f}s)\n")
 
-    # ADD THIS:
-    print("            Boundary edge node IDs:")
-    for i in range(min(nbd, 10)):  # Show first 10
-        n1, n2 = nbdnc[0, i], nbdnc[1, i]
-        x1, y1 = full_mesh.nodes.loc[n1, 'x'], full_mesh.nodes.loc[n1, 'y']
-        x2, y2 = full_mesh.nodes.loc[n2, 'x'], full_mesh.nodes.loc[n2, 'y']
-        print(f"              Edge {i}: ({n1}, {n2}) - ({x1:.2f}, {y1:.2f}) to ({x2:.2f}, {y2:.2f})")
-    # Step 7: Find submesh boundaries
-    t0 = time.time()
-    print("[Step 7/10] Finding submesh boundary edges...")
-    mmaps = np.ones(len(submesh.elements), dtype=np.int32)
-    nbls, nblncs = mkeline(len(submesh.nodes), len(submesh.elements), submesh.elements, mmaps)
-    print(f"            Found {nbls:,} submesh boundary edges ({time.time()-t0:.1f}s)\n")
+    # # ADD THIS:
+    # print("            Boundary edge node IDs:")
+    # for i in range(min(nbd, 10)):  # Show first 10
+    #     n1, n2 = nbdnc[0, i], nbdnc[1, i]
+    #     x1, y1 = full_mesh.nodes.loc[n1, 'x'], full_mesh.nodes.loc[n1, 'y']
+    #     x2, y2 = full_mesh.nodes.loc[n2, 'x'], full_mesh.nodes.loc[n2, 'y']
+    #     print(f"              Edge {i}: ({n1}, {n2}) - ({x1:.2f}, {y1:.2f}) to ({x2:.2f}, {y2:.2f})")
+    # # Step 7: Find submesh boundaries
+    # t0 = time.time()
+    # print("[Step 7/10] Finding submesh boundary edges...")
+    # mmaps = np.ones(len(submesh.elements), dtype=np.int32)
+    # nbls, nblncs = mkeline(len(submesh.nodes), len(submesh.elements), submesh.elements, mmaps)
+    # print(f"            Found {nbls:,} submesh boundary edges ({time.time()-t0:.1f}s)\n")
 
 
     # Step 8: Match boundary nodes between meshes
     t0 = time.time()
     print("[Step 8/10] Matching boundary nodes between global and submesh...")
-
+    print(" NOW CHECKING! the pair nodes of broders to submesh")
     # Create position-to-ID and ID-to-position mappings for both meshes
     global_node_ids = full_mesh.nodes.index.to_numpy()
     submesh_node_ids = submesh.nodes.index.to_numpy()
@@ -167,182 +289,237 @@ def merge_domain(submesh, full_mesh, path='.', file_header='grid'):
     nmaps = np.ones(len(submesh.nodes), dtype=int) * -1
     mmap = np.zeros(num_elements, dtype=np.int32)
     nprop1 = np.zeros(num_nodes, dtype=int)  # Store submesh POSITIONS, not IDs
-    nptable = np.zeros(num_nodes, dtype=int)
-
-    # Mark all nodes in subgrid elements with nptable = 1 (to be replaced by submesh)
-    for elem_pos in range(len(full_mesh.elements)):
-        if netable[elem_pos] == 1:
-            elem_id = global_elem_ids[elem_pos]
-            n1_id = full_mesh.elements.loc[elem_id, 'node_1']
-            n2_id = full_mesh.elements.loc[elem_id, 'node_2']
-            n3_id = full_mesh.elements.loc[elem_id, 'node_3']
-            nptable[global_node_id_to_pos[n1_id]] = 1
-            nptable[global_node_id_to_pos[n2_id]] = 1
-            nptable[global_node_id_to_pos[n3_id]] = 1
-
-    n_interior = np.sum(nptable == 1)
-    print(f"            Marked {n_interior:,} nodes in subgrid region as interior (nptable=1)\n")
-
+    
     eps = 1e-6
     j = 0
-    n_matched = 0
-    unmatched_details = []  # Store details of unmatched edges
-
-    # Progress tracking for node matching
-    progress_interval = max(1, nbd // 10)  # Report every 10%
-
+    
     for n in range(nbd):
-        if n % progress_interval == 0 and n > 0:
-            pct = 100 * n / nbd
-            print(f"            ... {pct:.0f}% ({n:,}/{nbd:,} edges, {n_matched:,} nodes matched)")
-
-        n1 = nbdnc[0,n]  # Global node ID
-        n2 = nbdnc[1, n]  # Global node ID
-        n1_pos = global_node_id_to_pos[n1]  # Convert to position
-        n2_pos = global_node_id_to_pos[n2]
+       
+        n1 = int(nbdnc[0, n])+ 1
+        n2 = int(nbdnc[1, n])+ 1
+        print('MID LOOP' , n1, n2)        
         xn1 = full_mesh.nodes.loc[n1, 'x']
         yn1 = full_mesh.nodes.loc[n1, 'y']
         xn2 = full_mesh.nodes.loc[n2, 'x']
         yn2 = full_mesh.nodes.loc[n2, 'y']
-        nptable[n1_pos] = 2
-        nptable[n2_pos] = 2
+        nptable[n1 -1] = 2
+        nptable[n2 -1] = 2
         i = 0
-        best_match_dist = float('inf')
-        best_match_edge = None
-
         for m in range(nbls):
-            m1 = nblncs[0,m]  # Submesh node ID
-            m2 = nblncs[1,m]  # Submesh node ID
-            m1_pos = submesh_node_id_to_pos[m1]  # Convert to position
-            m2_pos = submesh_node_id_to_pos[m2]
+            
+            m1 = nblncs[0, m] + 1
+            m2 = nblncs[1, m] + 1
+            print('NEXT LOOP', m1, m2)
             dx1 = xn1 - submesh.nodes.loc[m1, 'x']
             dy1 = yn1 - submesh.nodes.loc[m1, 'y']
             dx2 = xn2 - submesh.nodes.loc[m2, 'x']
             dy2 = yn2 - submesh.nodes.loc[m2, 'y']
-            dx1 = dx1**2 + dy1**2
-            dx2 = dx2**2 + dy2**2
-            dist1 = np.sqrt(dx1)
-            dist2 = np.sqrt(dx2)
-            max_dist = max(dist1, dist2)
-
-            # Track closest match even if it fails
-            if max_dist < best_match_dist:
-                best_match_dist = max_dist
-                best_match_edge = (m1, m2, dist1, dist2)
-
-            if (dist1 <= eps and dist2 <= eps):
+            if (np.sqrt(dx1) <= eps and np.sqrt(dx2) <= eps):
                 i += 1
-                n_matched += 2
-                nmaps[m1_pos] = n1  # Store global node ID at submesh position
-                nmaps[m2_pos] = n2
-                nprop1[n1_pos] = m1_pos  # Store submesh POSITION at global position
-                nprop1[n2_pos] = m2_pos
+                nmaps[m1-1] = n1
+                nmaps[m2-1] = n2
+                nprop1[n1-1] = m1
+                nprop1[n2-1] = m2
                 break
-
-        if i == 0:
+        if (i == 0):
             j += 1
-            # Store detailed information about the unmatched edge
-            unmatched_details.append({
-                'global_edge': (n1, n2),
-                'global_coords': ((xn1, yn1), (xn2, yn2)),
-                'best_submesh_edge': best_match_edge[:2] if best_match_edge else None,
-                'best_distances': best_match_edge[2:] if best_match_edge else None,
-                'eps': eps
-            })
+            print(' Node on border of grids are not matching', n1, n2, 'not found in subgrid')
+        if (j != 0):
+            'Hit enter key to stop'
+        nprops = np.zeros(len(submesh.nodes))
+        nd = 0
+        for n in range(len(submesh.nodes)):
+            if (nmaps[n] == -1):
+                nprops[nd] = n
+                nd += 1
+    print ('nprops: ', nprops)
+    # # # # Mark all nodes in subgrid elements with nptable = 1 (to be replaced by submesh)
+    # # # for elem_pos in range(len(full_mesh.elements)):
+    # # #     if netable[elem_pos] == 1:
+    # # #         elem_id = global_elem_ids[elem_pos]
+    # # #         n1_id = full_mesh.elements.loc[elem_id, 'node_1']
+    # # #         n2_id = full_mesh.elements.loc[elem_id, 'node_2']
+    # # #         n3_id = full_mesh.elements.loc[elem_id, 'node_3']
+    # # #         nptable[global_node_id_to_pos[n1_id]] = 1
+    # # #         nptable[global_node_id_to_pos[n2_id]] = 1
+    # # #         nptable[global_node_id_to_pos[n3_id]] = 1
 
-    print(f"            Matched {n_matched:,} boundary nodes ({time.time()-t0:.1f}s)")
-    print(f"            Total boundary edges to match: {nbd:,}")
-    print(f"            Successfully matched edges: {nbd - j:,}")
-    print(f"            Failed to match edges: {j:,}")
+    # # # n_interior = np.sum(nptable == 1)
+    # # # print(f"            Marked {n_interior:,} nodes in subgrid region as interior (nptable=1)\n")
 
-    if j > 0:
-        print(f"            WARNING: {j} edges failed to match - system may be unstable")
-        print("\n            UNMATCHED EDGE DETAILS (showing first 10):")
-        print(f"            {'='*80}")
-        for idx, detail in enumerate(unmatched_details[:10]):
-            n1, n2 = detail['global_edge']
-            (x1, y1), (x2, y2) = detail['global_coords']
-            print(f"\n            Unmatched Edge #{idx+1}:")
-            print(f"              Global edge: ({n1}, {n2})")
-            print(f"              Global node {n1}: ({x1:.6f}, {y1:.6f})")
-            print(f"              Global node {n2}: ({x2:.6f}, {y2:.6f})")
+    # # # eps = 1e-6
+    # # # j = 0
+    # # # n_matched = 0
+    # # # unmatched_details = []  # Store details of unmatched edges
 
-            if detail['best_submesh_edge']:
-                m1, m2 = detail['best_submesh_edge']
-                dist1, dist2 = detail['best_distances']
-                sm1_x = submesh.nodes.loc[m1, 'x']
-                sm1_y = submesh.nodes.loc[m1, 'y']
-                sm2_x = submesh.nodes.loc[m2, 'x']
-                sm2_y = submesh.nodes.loc[m2, 'y']
-                print(f"              Closest submesh edge: ({m1}, {m2})")
-                print(f"              Submesh node {m1}: ({sm1_x:.6f}, {sm1_y:.6f}) [dist={dist1:.2e}]")
-                print(f"              Submesh node {m2}: ({sm2_x:.6f}, {sm2_y:.6f}) [dist={dist2:.2e}]")
-                print(f"              Max distance: {max(dist1, dist2):.2e} (threshold: {detail['eps']:.2e})")
-            else:
-                print("              No submesh edges found")
-        print(f"            {'='*80}\n")
-    else:
-        print()
+    # # # # Progress tracking for node matching
+    # # # progress_interval = max(1, nbd // 10)  # Report every 10%
 
-    # Debug: Show nptable breakdown
-    n_global_only = np.sum(nptable == 0)
-    n_interior_subgrid = np.sum(nptable == 1)
-    n_boundary = np.sum(nptable == 2)
-    print("            nptable breakdown:")
-    print(f"              0 (global, keep): {n_global_only:,}")
-    print(f"              1 (interior, replace): {n_interior_subgrid:,}")
-    print(f"              2 (boundary, matched): {n_boundary:,}")
-    print(f"              Total: {n_global_only + n_interior_subgrid + n_boundary:,}\n")
+    # # # for n in range(nbd):
+    # # #     if n % progress_interval == 0 and n > 0:
+    # # #         pct = 100 * n / nbd
+    # # #         print(f"            ... {pct:.0f}% ({n:,}/{nbd:,} edges, {n_matched:,} nodes matched)")
+
+    # # #     n1 = nbdnc[0,n]  # Global node ID
+    # # #     n2 = nbdnc[1, n]  # Global node ID
+    # # #     n1_pos = global_node_id_to_pos[n1]  # Convert to position
+    # # #     n2_pos = global_node_id_to_pos[n2]
+    # # #     xn1 = full_mesh.nodes.loc[n1, 'x']
+    # # #     yn1 = full_mesh.nodes.loc[n1, 'y']
+    # # #     xn2 = full_mesh.nodes.loc[n2, 'x']
+    # # #     yn2 = full_mesh.nodes.loc[n2, 'y']
+    # # #     nptable[n1_pos] = 2
+    # # #     nptable[n2_pos] = 2
+    # # #     i = 0
+    # # #     best_match_dist = float('inf')
+    # # #     best_match_edge = None
+
+    # # #     for m in range(nbls):
+    # # #         m1 = nblncs[0,m]  # Submesh node ID
+    # # #         m2 = nblncs[1,m]  # Submesh node ID
+    # # #         m1_pos = submesh_node_id_to_pos[m1]  # Convert to position
+    # # #         m2_pos = submesh_node_id_to_pos[m2]
+    # # #         dx1 = xn1 - submesh.nodes.loc[m1, 'x']
+    # # #         dy1 = yn1 - submesh.nodes.loc[m1, 'y']
+    # # #         dx2 = xn2 - submesh.nodes.loc[m2, 'x']
+    # # #         dy2 = yn2 - submesh.nodes.loc[m2, 'y']
+    # # #         dx1 = dx1**2 + dy1**2
+    # # #         dx2 = dx2**2 + dy2**2
+    # # #         dist1 = np.sqrt(dx1)
+    # # #         dist2 = np.sqrt(dx2)
+    # # #         max_dist = max(dist1, dist2)
+
+    # # #         # Track closest match even if it fails
+    # # #         if max_dist < best_match_dist:
+    # # #             best_match_dist = max_dist
+    # # #             best_match_edge = (m1, m2, dist1, dist2)
+
+    # # #         if (dist1 <= eps and dist2 <= eps):
+    # # #             i += 1
+    # # #             n_matched += 2
+    # # #             nmaps[m1_pos] = n1  # Store global node ID at submesh position
+    # # #             nmaps[m2_pos] = n2
+    # # #             nprop1[n1_pos] = m1_pos  # Store submesh POSITION at global position
+    # # #             nprop1[n2_pos] = m2_pos
+    # # #             break
+
+    # # #     if i == 0:
+    # # #         j += 1
+    # # #         # Store detailed information about the unmatched edge
+    # # #         unmatched_details.append({
+    # # #             'global_edge': (n1, n2),
+    # # #             'global_coords': ((xn1, yn1), (xn2, yn2)),
+    # # #             'best_submesh_edge': best_match_edge[:2] if best_match_edge else None,
+    # # #             'best_distances': best_match_edge[2:] if best_match_edge else None,
+    # # #             'eps': eps
+    # # #         })
+
+    # # # print(f"            Matched {n_matched:,} boundary nodes ({time.time()-t0:.1f}s)")
+    # # # print(f"            Total boundary edges to match: {nbd:,}")
+    # # # print(f"            Successfully matched edges: {nbd - j:,}")
+    # # # print(f"            Failed to match edges: {j:,}")
+
+    # # if j > 0:
+    # #     print(f"            WARNING: {j} edges failed to match - system may be unstable")
+    # #     print("\n            UNMATCHED EDGE DETAILS (showing first 10):")
+    # #     print(f"            {'='*80}")
+    # #     for idx, detail in enumerate(unmatched_details[:10]):
+    # #         n1, n2 = detail['global_edge']
+    # #         (x1, y1), (x2, y2) = detail['global_coords']
+    # #         print(f"\n            Unmatched Edge #{idx+1}:")
+    # #         print(f"              Global edge: ({n1}, {n2})")
+    # #         print(f"              Global node {n1}: ({x1:.6f}, {y1:.6f})")
+    # #         print(f"              Global node {n2}: ({x2:.6f}, {y2:.6f})")
+
+    # #         if detail['best_submesh_edge']:
+    # #             m1, m2 = detail['best_submesh_edge']
+    # #             dist1, dist2 = detail['best_distances']
+    # #             sm1_x = submesh.nodes.loc[m1, 'x']
+    # #             sm1_y = submesh.nodes.loc[m1, 'y']
+    # #             sm2_x = submesh.nodes.loc[m2, 'x']
+    # #             sm2_y = submesh.nodes.loc[m2, 'y']
+    # #             print(f"              Closest submesh edge: ({m1}, {m2})")
+    # #             print(f"              Submesh node {m1}: ({sm1_x:.6f}, {sm1_y:.6f}) [dist={dist1:.2e}]")
+    # #             print(f"              Submesh node {m2}: ({sm2_x:.6f}, {sm2_y:.6f}) [dist={dist2:.2e}]")
+    # #             print(f"              Max distance: {max(dist1, dist2):.2e} (threshold: {detail['eps']:.2e})")
+    # #         else:
+    # #             print("              No submesh edges found")
+    # #     print(f"            {'='*80}\n")
+    # # else:
+    # #     print()
+
+    # # Debug: Show nptable breakdown
+    # n_global_only = np.sum(nptable == 0)
+    # n_interior_subgrid = np.sum(nptable == 1)
+    # n_boundary = np.sum(nptable == 2)
+    # print("            nptable breakdown:")
+    # print(f"              0 (global, keep): {n_global_only:,}")
+    # print(f"              1 (interior, replace): {n_interior_subgrid:,}")
+    # print(f"              2 (boundary, matched): {n_boundary:,}")
+    # print(f"              Total: {n_global_only + n_interior_subgrid + n_boundary:,}\n")
 
     # Step 9: Create node ID mappings
+    
+
+    # # Build list of unmatched submesh nodes (those not on boundary)
+    # nprops = np.zeros(len(submesh.nodes), dtype=int)
+    # nd = 0
+
+    # # Build 1-based list of unmatched submesh node positions
+    # unmatched = np.flatnonzero(nmaps == -1)
+    # nd = unmatched.size
+
+    # # 1-based helper array: index 0 is intentionally unused
+    # nprops = np.empty(nd + 1, dtype=int)
+    # nprops[0] = -1           # sentinel; never read by your later logic
+    # nprops[1:] = unmatched
+
+
+    # print(f"            Found {nd:,} unmatched submesh nodes (interior nodes)")
+    # print(f"            Found {np.sum(nmaps != -1):,} matched submesh nodes (boundary nodes)")
+    # print(f"            Total submesh nodes: {len(submesh.nodes):,}\n")
+
+    # n1 = 0
+    # n2 = 0
+    # m = 0
+    # npn = 0
+    # n_global_interior = np.sum(nptable == 1)
+    # n_submesh_interior = nd
+    # print(f"Global interior nodes (nptable==1): {n_global_interior}")
+    # print(f"Submesh interior nodes (nd): {n_submesh_interior}")
+    # if n_global_interior != n_submesh_interior:
+    #     print(f"WARNING: Mismatch! Difference: {abs(n_global_interior - n_submesh_interior)}")
+    print('WHAT IS NPROPS RIGHT NOW????' , nprops, len(nprops), np.sum(nptable), np.where(np.array(nptable) == 1))
     t0 = time.time()
     print("[Step 9/10] Creating node and element ID mappings...")
-
-    # Build list of unmatched submesh nodes (those not on boundary)
-    nprops = np.zeros(len(submesh.nodes), dtype=int)
-    nd = 0
-
-    # Build 1-based list of unmatched submesh node positions
-    unmatched = np.flatnonzero(nmaps == -1)
-    nd = unmatched.size
-
-    # 1-based helper array: index 0 is intentionally unused
-    nprops = np.empty(nd + 1, dtype=int)
-    nprops[0] = -1           # sentinel; never read by your later logic
-    nprops[1:] = unmatched
-
-
-    print(f"            Found {nd:,} unmatched submesh nodes (interior nodes)")
-    print(f"            Found {np.sum(nmaps != -1):,} matched submesh nodes (boundary nodes)")
-    print(f"            Total submesh nodes: {len(submesh.nodes):,}\n")
-
     n1 = 0
     n2 = 0
     m = 0
     npn = 0
-    n_global_interior = np.sum(nptable == 1)
-    n_submesh_interior = nd
-    print(f"Global interior nodes (nptable==1): {n_global_interior}")
-    print(f"Submesh interior nodes (nd): {n_submesh_interior}")
-    if n_global_interior != n_submesh_interior:
-        print(f"WARNING: Mismatch! Difference: {abs(n_global_interior - n_submesh_interior)}")
+    nptable = np.array(nptable)
+    
     for n in range(num_nodes):
         if nptable[n] == 0:
             m += 1
             nmap[n] = m
         elif nptable[n] == 1:
             if (n1 + 1 <= nd):
-                n1 += 1
                 m += 1
-                nmaps[nprops[n1]] = m
+                print(n1)
+                nmaps[int(nprops[n1])] = m
+                n1 += 1
         elif nptable[n] == 2:
             m += 1
+            print('Nptable[n]==2 ',nprop1[n])
             nmap[n] = m
-            nmaps[nprop1[n]] = m
+            nmaps[nprop1[n]-1] = m
+        
+            
 
     print(f"            After main loop: n1={n1}, nd={nd}, m={m}")
     print(f"            Nodes from nptable=1 that got IDs: {n1}")
     print(f"            Remaining unmatched nodes to add: {nd - n1}")
+    print('NMAPS after everything', nmaps)
 
 
     for n in range(n1+1, nd+1):
@@ -353,6 +530,7 @@ def merge_domain(submesh, full_mesh, path='.', file_header='grid'):
     print(f"            Final node count (npn): {npn}\n")
 
     # Element mapping
+    print('NOW STARTING ELEMENT MAPPING')
     n = 0
     for m in range(num_elements):
         if netable[m] == 1:
@@ -373,229 +551,464 @@ def merge_domain(submesh, full_mesh, path='.', file_header='grid'):
                 n += 1
                 mmap[m] = mmaps[len(submesh.elements) - 1] + n  # Fix: -1 for 0-based indexing
     print(f"            Created mappings for {npn:,} nodes, {nen:,} elements ({time.time()-t0:.1f}s)\n")
-    # Diagnostic: Check for invalid nmaps values
-    invalid_nmaps = np.sum((nmaps == -1) | (nmaps == 0))
-    if invalid_nmaps > 0:
-        print(f"            ERROR: {invalid_nmaps} submesh nodes have invalid IDs!")
-        for idx in range(len(submesh.nodes)):
-            if nmaps[idx] == -1 or nmaps[idx] == 0:
-                print(f"              Submesh node idx={idx}, nmaps[idx]={nmaps[idx]}")
-        # Check for duplicates in submesh nodes
-    submesh_ids = [nmaps[idx] for idx in range(len(submesh.nodes))]
-    if len(submesh_ids) != len(set(submesh_ids)):
-        print("            ERROR: Duplicate node IDs in submesh!")
+    print('OUTPUT OF MAPPING LOOP', mmap)
 
-        counts = Counter(submesh_ids)
-        for node_id, count in counts.items():
-            if count > 1:
-                print(f"              Node ID {node_id} appears {count} times")
-    # Also check nmap for nptable==0 nodes
-    invalid_nmap = 0
-    for g_pos in range(len(full_mesh.nodes)):
-        if nptable[g_pos] == 0 and nmap[g_pos] == 0:
-            invalid_nmap += 1
-    if invalid_nmap > 0:
-        print(f"            ERROR: {invalid_nmap} global preserved nodes have invalid IDs!")
+    print('NOW CREATING GLOBAL GRID')
+    # allocate(xydn(3,npn), nmn(nen,3))
+
+    xydn = [[0.0] * (npn + 1) for _ in range(3)]
+    nmn  = [[0]   * 4          for _ in range(nen + 1)]  # index 1..3 used
+    for n in range(len(submesh.nodes)):
+        new_n = nmaps[n]
+        xydn[0][new_n] = submesh.nodes.loc[n+1, 'x']
+        xydn[1][new_n] = submesh.nodes.loc[n+1, 'y']
+        xydn[2][new_n] = submesh.nodes.loc[n+1, 'z']
+    
+    for n in range(num_nodes):
+        if nptable[n] == 0:
+            new_n = nmap[n]
+            xydn[0][new_n] = full_mesh.nodes.loc[n+1, 'x']
+            xydn[1][new_n] = full_mesh.nodes.loc[n+1, 'y']
+            xydn[2][new_n] = full_mesh.nodes.loc[n+1, 'z']
+
+    new_nodes_df = pd.DataFrame(
+        {
+            'x': [xydn[0][n] for n in range(1, npn + 1)],
+            'y': [xydn[1][n] for n in range(1, npn + 1)],
+            'z': [xydn[2][n] for n in range(1, npn + 1)]
+        },
+        index=range(1, npn + 1)
+    )
+    for m in range(len(submesh.elements)):
+        new_m = int(mmaps[m])
+        print('inside element loop 1, ', new_m, )
+        nmn[new_m][0] = mmaps[ submesh.elements.loc[m+1, 'node_1'] ]
+        nmn[new_m][1] = mmaps[ submesh.elements.loc[m+1, 'node_2'] ]
+        nmn[new_m][2] = mmaps[ submesh.elements.loc[m+1, 'node_3'] ]
+    for m in range(num_elements):
+        if netable[m] == 0:
+            new_m = mmap[m]
+
+            nmn[new_m][0] = mmap[ full_mesh.elements.loc[m+1, 'node_1'] ]
+            nmn[new_m][1] = mmap[ full_mesh.elements.loc[m+1, 'node_2'] ]
+            nmn[new_m][2] = mmap[ full_mesh.elements.loc[m+1, 'node_3'] ]
+    elements_df = pd.DataFrame(
+        {
+            'node_1': [int(nmn[m][0]) for m in range(nen)],
+            'node_2': [int(nmn[m][1]) for m in range(nen)],
+            'node_3': [int(nmn[m][2]) for m in range(nen)],
+        },
+        index=range(1, nen + 1)
+    )
+    elements_df['n'] = 3
+    elements_df = elements_df.iloc[:, [3, 0, 1, 2]]
+    print(new_nodes_df.head(), elements_df.head(), nmn[0:5])
+
+    # # Diagnostic: Check for invalid nmaps values
+    # invalid_nmaps = np.sum((nmaps == -1) | (nmaps == 0))
+    # if invalid_nmaps > 0:
+    #     print(f"            ERROR: {invalid_nmaps} submesh nodes have invalid IDs!")
+    #     for idx in range(len(submesh.nodes)):
+    #         if nmaps[idx] == -1 or nmaps[idx] == 0:
+    #             print(f"              Submesh node idx={idx}, nmaps[idx]={nmaps[idx]}")
+    #     # Check for duplicates in submesh nodes
+    # submesh_ids = [nmaps[idx] for idx in range(len(submesh.nodes))]
+    # if len(submesh_ids) != len(set(submesh_ids)):
+    #     print("            ERROR: Duplicate node IDs in submesh!")
+
+    #     counts = Counter(submesh_ids)
+    #     for node_id, count in counts.items():
+    #         if count > 1:
+    #             print(f"              Node ID {node_id} appears {count} times")
+    # # Also check nmap for nptable==0 nodes
+    # invalid_nmap = 0
+    # for g_pos in range(len(full_mesh.nodes)):
+    #     if nptable[g_pos] == 0 and nmap[g_pos] == 0:
+    #         invalid_nmap += 1
+    # if invalid_nmap > 0:
+    #     print(f"            ERROR: {invalid_nmap} global preserved nodes have invalid IDs!")
  
-    # --- PATCH 1: Renumber guard (contiguous 1..npn) -----------------------------
-    # Collect ALL merged node IDs that will be used to write the mesh:
-    #  - All submesh nodes (from nmaps), and
-    #  - All preserved global nodes (nptable==0) via nmap.
-    used_ids = set(int(x) for x in nmaps if int(x) > 0)
+    # # --- PATCH 1: Renumber guard (contiguous 1..npn) -----------------------------
+    # # Collect ALL merged node IDs that will be used to write the mesh:
+    # #  - All submesh nodes (from nmaps), and
+    # #  - All preserved global nodes (nptable==0) via nmap.
+    # used_ids = set(int(x) for x in nmaps if int(x) > 0)
 
-    for g_pos in range(num_nodes):
-        if nptable[g_pos] == 0 and nmap[g_pos] > 0:
-            used_ids.add(int(nmap[g_pos]))
+    # for g_pos in range(num_nodes):
+    #     if nptable[g_pos] == 0 and nmap[g_pos] > 0:
+    #         used_ids.add(int(nmap[g_pos]))
 
-    # Create a contiguous mapping old_id -> 1..npn
-    sorted_ids = sorted(used_ids)
-    id_to_seq = {old: i + 1 for i, old in enumerate(sorted_ids)}
-    npn = len(sorted_ids)  # update to the final contiguous count
+    # # Create a contiguous mapping old_id -> 1..npn
+    # sorted_ids = sorted(used_ids)
+    # id_to_seq = {old: i + 1 for i, old in enumerate(sorted_ids)}
+    # npn = len(sorted_ids)  # update to the final contiguous count
 
-    # Remap nmaps (submesh positions -> new merged node IDs)
-    nmaps = np.array([id_to_seq.get(int(val), 0) for val in nmaps], dtype=int)
+    # # Remap nmaps (submesh positions -> new merged node IDs)
+    # nmaps = np.array([id_to_seq.get(int(val), 0) for val in nmaps], dtype=int)
 
-    # Remap nmap (global positions -> new merged node IDs), but only for preserved nodes
-    for g_pos in range(num_nodes):
-        if nptable[g_pos] == 0 and nmap[g_pos] > 0:
-            nmap[g_pos] = id_to_seq[int(nmap[g_pos])]
+    # # Remap nmap (global positions -> new merged node IDs), but only for preserved nodes
+    # for g_pos in range(num_nodes):
+    #     if nptable[g_pos] == 0 and nmap[g_pos] > 0:
+    #         nmap[g_pos] = id_to_seq[int(nmap[g_pos])]
 
-    # Final assertions (fail-fast if something still looks wrong)
-    assert np.all(nmaps > 0), "nmaps contains non-positive IDs after renumbering"
-    assert len(np.unique(nmaps)) <= npn, "nmaps has more unique IDs than npn"
+    # # Final assertions (fail-fast if something still looks wrong)
+    # assert np.all(nmaps > 0), "nmaps contains non-positive IDs after renumbering"
+    # assert len(np.unique(nmaps)) <= npn, "nmaps has more unique IDs than npn"
 
-    # Step 10: Build merged mesh
-    t0 = time.time()
-    print("[Step 10/10] Building merged mesh...")
+    # # Step 10: Build merged mesh
+    # t0 = time.time()
+    # print("[Step 10/10] Building merged mesh...")
 
-    # Merge nodes
-    merged = {}
-    for idx in range(len(submesh.nodes)):
-        new_id = nmaps[idx]
-        merged[new_id] = {
-            'x': submesh.nodes.iloc[idx]['x'],
-            'y': submesh.nodes.iloc[idx]['y'],
-            'z': submesh.nodes.iloc[idx]['z']
-        }
+    # # Merge nodes
+    # merged = {}
+    # for idx in range(len(submesh.nodes)):
+    #     new_id = nmaps[idx]
+    #     merged[new_id] = {
+    #         'x': submesh.nodes.iloc[idx]['x'],
+    #         'y': submesh.nodes.iloc[idx]['y'],
+    #         'z': submesh.nodes.iloc[idx]['z']
+    #     }
 
-    for g_pos in range(len(full_mesh.nodes)):
-        if nptable[g_pos] == 0:
-            new_id = nmap[g_pos]
-            g_node_id = global_node_ids[g_pos]
-            merged[new_id] = {
-                'x': full_mesh.nodes.loc[g_node_id, 'x'],
-                'y': full_mesh.nodes.loc[g_node_id, 'y'],
-                'z': full_mesh.nodes.loc[g_node_id, 'z']
-            }
+    # for g_pos in range(len(full_mesh.nodes)):
+    #     if nptable[g_pos] == 0:
+    #         new_id = nmap[g_pos]
+    #         g_node_id = global_node_ids[g_pos]
+    #         merged[new_id] = {
+    #             'x': full_mesh.nodes.loc[g_node_id, 'x'],
+    #             'y': full_mesh.nodes.loc[g_node_id, 'y'],
+    #             'z': full_mesh.nodes.loc[g_node_id, 'z']
+    #         }
 
-    merged_nodes = pd.DataFrame.from_dict(merged, orient='index')
-    merged_nodes = merged_nodes.sort_index()
-    print(f"            Created {len(merged_nodes):,} nodes")
-    expected_ids = set(range(npn))
-    created_ids = set(merged_nodes.index)
+    # merged_nodes = pd.DataFrame.from_dict(merged, orient='index')
+    # merged_nodes = merged_nodes.sort_index()
+    # print(f"            Created {len(merged_nodes):,} nodes")
+    # expected_ids = set(range(npn))
+    # created_ids = set(merged_nodes.index)
 
-    missing = sorted(expected_ids - created_ids)
+    # missing = sorted(expected_ids - created_ids)
 
-    print(f"Missing node IDs ({len(missing)}):", missing)
+    # print(f"Missing node IDs ({len(missing)}):", missing)
 
-    # Merge elements
-    merged_elements = {}
-    elem_counter = 1
-    for s_pos in range(len(submesh.elements)):
-        n1_id = submesh.elements.iloc[s_pos]['node_1']
-        n2_id = submesh.elements.iloc[s_pos]['node_2']
-        n3_id = submesh.elements.iloc[s_pos]['node_3']
+    # # Merge elements
+    # merged_elements = {}
+    # elem_counter = 1
+    # for s_pos in range(len(submesh.elements)):
+    #     n1_id = submesh.elements.iloc[s_pos]['node_1']
+    #     n2_id = submesh.elements.iloc[s_pos]['node_2']
+    #     n3_id = submesh.elements.iloc[s_pos]['node_3']
 
-        # Convert node IDs to positions to access nmaps
-        n1_pos = submesh_node_id_to_pos[n1_id]
-        n2_pos = submesh_node_id_to_pos[n2_id]
-        n3_pos = submesh_node_id_to_pos[n3_id]
+    #     # Convert node IDs to positions to access nmaps
+    #     n1_pos = submesh_node_id_to_pos[n1_id]
+    #     n2_pos = submesh_node_id_to_pos[n2_id]
+    #     n3_pos = submesh_node_id_to_pos[n3_id]
 
-        merged_elements[elem_counter] = {
-            'node_1': nmaps[n1_pos],
-            'node_2': nmaps[n2_pos],
-            'node_3': nmaps[n3_pos]
-        }
+    #     merged_elements[elem_counter] = {
+    #         'node_1': nmaps[n1_pos],
+    #         'node_2': nmaps[n2_pos],
+    #         'node_3': nmaps[n3_pos]
+    #     }
 
-        elem_counter += 1
+    #     elem_counter += 1
 
-    for g_pos in range(len(full_mesh.elements)):
-        if netable[g_pos] == 0:
-            g_elem_id = global_elem_ids[g_pos]
-            n1_id = full_mesh.elements.loc[g_elem_id, 'node_1']
-            n2_id = full_mesh.elements.loc[g_elem_id, 'node_2']
-            n3_id = full_mesh.elements.loc[g_elem_id, 'node_3']
+    # for g_pos in range(len(full_mesh.elements)):
+    #     if netable[g_pos] == 0:
+    #         g_elem_id = global_elem_ids[g_pos]
+    #         n1_id = full_mesh.elements.loc[g_elem_id, 'node_1']
+    #         n2_id = full_mesh.elements.loc[g_elem_id, 'node_2']
+    #         n3_id = full_mesh.elements.loc[g_elem_id, 'node_3']
 
-            # Convert node IDs to positions to access nmap
-            n1_pos = global_node_id_to_pos[n1_id]
-            n2_pos = global_node_id_to_pos[n2_id]
-            n3_pos = global_node_id_to_pos[n3_id]
+    #         # Convert node IDs to positions to access nmap
+    #         n1_pos = global_node_id_to_pos[n1_id]
+    #         n2_pos = global_node_id_to_pos[n2_id]
+    #         n3_pos = global_node_id_to_pos[n3_id]
 
-            merged_elements[elem_counter] = {
-                'node_1': nmap[n1_pos],
-                'node_2': nmap[n2_pos],
-                'node_3': nmap[n3_pos]
-            }
-            elem_counter += 1
+    #         merged_elements[elem_counter] = {
+    #             'node_1': nmap[n1_pos],
+    #             'node_2': nmap[n2_pos],
+    #             'node_3': nmap[n3_pos]
+    #         }
+    #         elem_counter += 1
         
-    merged_ele = pd.DataFrame.from_dict(merged_elements, orient='index')
-    merged_ele = merged_ele.sort_index()
-    print(f"            Created {len(merged_ele):,} elements ({time.time()-t0:.1f}s)\n")
+    
 
     # Boundary reconstruction
     t0 = time.time()
     print("[Boundaries] Reconstructing open boundaries...")
-    preliminary_segments = []
-    for segment in full_mesh.boundaries['open']:
-        current_segment_nodes = []
-        for boundary_node in segment.nodes:
-            old_node_id = boundary_node.node_id
-            old_node_pos = global_node_id_to_pos[old_node_id]
-            if nptable[old_node_pos] == 0:  # Node preserved in merged mesh
-                new_node_id = int(nmap[old_node_pos])
-                current_segment_nodes.append(BoundaryNode(node_id=new_node_id))
-            else:  # Node replaced, break segment
-                if current_segment_nodes:
-                    preliminary_segments.append(current_segment_nodes)
-                    current_segment_nodes = []
-        if current_segment_nodes:
-            preliminary_segments.append(current_segment_nodes)
+    # preliminary_segments = []
+    # for segment in full_mesh.boundaries['open']:
+    #     current_segment_nodes = []
+    #     for boundary_node in segment.nodes:
+    #         old_node_id = boundary_node.node_id
+    #         old_node_pos = global_node_id_to_pos[old_node_id]
+    #         if nptable[old_node_pos] == 0:  # Node preserved in merged mesh
+    #             new_node_id = int(nmap[old_node_pos])
+    #             current_segment_nodes.append(BoundaryNode(node_id=new_node_id))
+    #         else:  # Node replaced, break segment
+    #             if current_segment_nodes:
+    #                 preliminary_segments.append(current_segment_nodes)
+    #                 current_segment_nodes = []
+    #     if current_segment_nodes:
+    #         preliminary_segments.append(current_segment_nodes)
 
-        # Phase 2: Reconnect segments by matching tails to heads
-    merged_open_bounds = []
-    used_segments = set()
+    #     # Phase 2: Reconnect segments by matching tails to heads
+    # merged_open_bounds = []
+    # used_segments = set()
 
-    while len(used_segments) < len(preliminary_segments):
-        # Find an unused segment with no predecessor (head of chain)
-        chain_start_idx = None
-        for n in range(len(preliminary_segments)):
-            if n in used_segments:
-                continue
+    # while len(used_segments) < len(preliminary_segments):
+    #     # Find an unused segment with no predecessor (head of chain)
+    #     chain_start_idx = None
+    #     for n in range(len(preliminary_segments)):
+    #         if n in used_segments:
+    #             continue
             
-            segment_first_node = preliminary_segments[n][0].node_id
+    #         segment_first_node = preliminary_segments[n][0].node_id
             
-            # Check if any other unused segment ends with this node
-            has_predecessor = False
-            for m in range(len(preliminary_segments)):
-                if m == n or m in used_segments:
-                    continue
-                segment_last_node = preliminary_segments[m][-1].node_id
-                if segment_first_node == segment_last_node:
-                    has_predecessor = True
-                    break
+    #         # Check if any other unused segment ends with this node
+    #         has_predecessor = False
+    #         for m in range(len(preliminary_segments)):
+    #             if m == n or m in used_segments:
+    #                 continue
+    #             segment_last_node = preliminary_segments[m][-1].node_id
+    #             if segment_first_node == segment_last_node:
+    #                 has_predecessor = True
+    #                 break
             
-            if not has_predecessor:
-                chain_start_idx = n
-                break
+    #         if not has_predecessor:
+    #             chain_start_idx = n
+    #             break
         
-        if chain_start_idx is None:
-            # This shouldn't happen with valid boundaries, but handle gracefully
-            # Take any remaining unused segment
-            for n in range(len(preliminary_segments)):
-                if n not in used_segments:
-                    chain_start_idx = n
-                    break
+    #     if chain_start_idx is None:
+    #         # This shouldn't happen with valid boundaries, but handle gracefully
+    #         # Take any remaining unused segment
+    #         for n in range(len(preliminary_segments)):
+    #             if n not in used_segments:
+    #                 chain_start_idx = n
+    #                 break
         
-        # Build the chain starting from chain_start_idx
-        chain_nodes = list(preliminary_segments[chain_start_idx])
-        used_segments.add(chain_start_idx)
-        current_end_node = chain_nodes[-1].node_id
+    #     # Build the chain starting from chain_start_idx
+    #     chain_nodes = list(preliminary_segments[chain_start_idx])
+    #     used_segments.add(chain_start_idx)
+    #     current_end_node = chain_nodes[-1].node_id
         
-        # Keep extending the chain
-        while True:
-            found_next = False
-            for n in range(len(preliminary_segments)):
-                if n in used_segments:
-                    continue
+    #     # Keep extending the chain
+    #     while True:
+    #         found_next = False
+    #         for n in range(len(preliminary_segments)):
+    #             if n in used_segments:
+    #                 continue
                 
-                segment_first_node = preliminary_segments[n][0].node_id
-                if current_end_node == segment_first_node:
-                    # Found continuation, append nodes (skip first since it duplicates last)
-                    chain_nodes.extend(preliminary_segments[n][1:])
-                    used_segments.add(n)
-                    current_end_node = chain_nodes[-1].node_id
-                    found_next = True
-                    break
+    #             segment_first_node = preliminary_segments[n][0].node_id
+    #             if current_end_node == segment_first_node:
+    #                 # Found continuation, append nodes (skip first since it duplicates last)
+    #                 chain_nodes.extend(preliminary_segments[n][1:])
+    #                 used_segments.add(n)
+    #                 current_end_node = chain_nodes[-1].node_id
+    #                 found_next = True
+    #                 break
             
-            if not found_next:
-                break  # No more segments to connect
-        
-        # Create the final boundary segment from the complete chain
-        merged_open_bounds.append(BoundarySegment(
-            nodes=tuple(chain_nodes),
-            category='open',
-            ibtype=None
-        ))
-    print(f"             Reconnected {len(preliminary_segments)} fragments into {len(merged_open_bounds)} boundaries ({time.time()-t0:.1f}s)\n")
+    #         if not found_next:
+    #             break  # No more segments to connect
+    preliminary_segments = []
+# Each entry: dict with keys:
+#   'nodes', 'ibtype', 'polarity'
 
-    t0 = time.time()
-    print("[Boundaries] Reconstructing land boundaries...")
-    merged_land_bounds = reconstruct_flow_boundaries(full_mesh.boundaries['land'], nmap, nptable, global_node_id_to_pos)
-    print(f"             Created {len(merged_land_bounds)} land boundaries ({time.time()-t0:.1f}s)\n")
+    for boundary_name, segments in full_mesh.boundaries.items():
 
-    t0 = time.time()
-    print("[Final] Creating merged mesh object and writing to file...")
-    merged_mesh = Mesh(nodes=merged_nodes, elements=merged_ele, boundaries={'open':merged_open_bounds, 'land': merged_land_bounds})
+        if boundary_name == 'open':
+            ibtype = 3        # matches Fortran open elevation
+        elif boundary_name == 'land':
+            # ibtype is stored per segment in your data
+            pass
+        else:
+            continue
+
+        for segment in segments:
+            current_nodes = []
+            polarity = 1
+
+            for j, bnode in enumerate(segment.nodes):
+
+                old_id = bnode.node_id
+                old_pos = global_node_id_to_pos[old_id]
+
+                # if( nptable(nbvv(k,j)) == 1 ) cycle
+                if nptable[old_pos] == 1:
+                    if current_nodes:
+                        preliminary_segments.append({
+                            'nodes': current_nodes,
+                            'ibtype': segment.ibtype,
+                            'polarity': polarity
+                        })
+                        current_nodes = []
+                        polarity = 1
+                    continue
+
+                new_node_id = int(nmap[old_pos])
+
+                # Handle connected_to (ibtype 4/24)
+                new_connected = None
+                if bnode.connected_to is not None:
+                    old_conn_pos = global_node_id_to_pos[bnode.connected_to]
+                    if nptable[old_conn_pos] == 1:
+                        if current_nodes:
+                            preliminary_segments.append({
+                                'nodes': current_nodes,
+                                'ibtype': segment.ibtype,
+                                'polarity': polarity
+                            })
+                            current_nodes = []
+                            polarity = 1
+                        continue
+                    new_connected = int(nmap[old_conn_pos])
+
+                current_nodes.append(
+                    BoundaryNode(
+                        node_id=new_node_id,
+                        connected_to=new_connected,
+                        barrier_heights=bnode.barrier_heights
+                    )
+                )
+
+                # --- orientation detection (Fortran nplseg = -1) ---
+                if j + 1 < len(segment.nodes):
+                    next_old_id = segment.nodes[j + 1].node_id
+                    next_old_pos = global_node_id_to_pos[next_old_id]
+
+                    if nptable[next_old_pos] != 1:
+                        n1 = old_id
+                        n2 = next_old_id
+                        for m in range(nbl):
+                            m1 = nblnc[0,m]
+                            m2 = nblnc[1,m]
+                            if (n1 == m2) and (n2 == m1):
+                                polarity = -1
+                                break
+
+            if current_nodes:
+                preliminary_segments.append({
+                    'nodes': current_nodes,
+                    'ibtype': segment.ibtype,
+                    'polarity': polarity
+                })
+    merged_boundaries = []
+    used = [0] * len(preliminary_segments)
+
+    while sum(used) < len(preliminary_segments):
+
+        # ---- search head ----
+        head_idx = None
+        for n, seg in enumerate(preliminary_segments):
+            if used[n]:
+                continue
+
+            nsta = seg['nodes'][0]
+            nd = None
+
+            for m, other in enumerate(preliminary_segments):
+                if m == n or used[m]:
+                    continue
+                if seg['ibtype'] != other['ibtype']:
+                    continue
+
+                nend = other['nodes'][-1]
+
+                io = ii = 0
+                if (nsta.node_id == nend.node_id and
+                    nsta.connected_to == nend.connected_to):
+                    io = 1
+                if (nsta.node_id == nend.connected_to and
+                    nsta.connected_to == nend.node_id):
+                    ii = 1
+
+                if io + ii == 2:
+                    raise RuntimeError("Fatal boundary ambiguity (Basis104)")
+
+                if io + ii == 1:
+                    nd = m
+                    break
+
+            if nd is None:
+                head_idx = n
+                break
+
+        if head_idx is None:
+            # fallback (Fortran-safe)
+            head_idx = used.index(0)
+
+        # ---- start new boundary ----
+        seg = preliminary_segments[head_idx]
+        chain_nodes = list(seg['nodes'])
+        chain_ibtype = seg['ibtype']
+        polarity = seg['polarity']
+        used[head_idx] = 1
+
+        nend = chain_nodes[-1]
+
+        # ---- extend ----
+        extended = True
+        while extended:
+            extended = False
+            for n, seg in enumerate(preliminary_segments):
+                if used[n] or seg['ibtype'] != chain_ibtype:
+                    continue
+
+                first = seg['nodes'][0]
+
+                io = ii = 0
+                if (nend.node_id == first.node_id and
+                    nend.connected_to == first.connected_to):
+                    io = 1
+                if (nend.node_id == first.connected_to and
+                    nend.connected_to == first.node_id):
+                    ii = 1
+
+                if io + ii == 2:
+                    raise RuntimeError("Fatal boundary ambiguity (Basis105)")
+
+                if io + ii == 1:
+                    # append (skip duplicate)
+                    if io == 1:
+                        chain_nodes.extend(seg['nodes'][1:])
+                    else:
+                        # swapped orientation
+                        for node in seg['nodes'][1:]:
+                            chain_nodes.append(
+                                BoundaryNode(
+                                    node_id=node.connected_to,
+                                    connected_to=node.node_id,
+                                    barrier_heights=node.barrier_heights
+                                )
+                            )
+                    nend = chain_nodes[-1]
+                    used[n] = 1
+                    extended = True
+                    break
+
+        merged_boundaries.append(
+            BoundarySegment(
+                nodes=tuple(chain_nodes),
+                category='open' if chain_ibtype is None else 'land',
+                ibtype=None if chain_ibtype is None else chain_ibtype
+            )
+        )
+    print(len(merged_boundaries))
+
+        # # Create the final boundary segment from the complete chain
+        # merged_open_bounds.append(BoundarySegment(
+        #     nodes=tuple(chain_nodes),
+        #     category='open',
+        #     ibtype=None
+        # ))
+    # print(f"             Reconnected {len(preliminary_segments)} fragments into {len(merged_open_bounds)} boundaries ({time.time()-t0:.1f}s)\n")
+
+    # t0 = time.time()
+    # print("[Boundaries] Reconstructing land boundaries...", len(full_mesh.boundaries['land']))
+    # merged_land_bounds = reconstruct_flow_boundaries(full_mesh.boundaries['land'], nmap, nptable, global_node_id_to_pos)
+    # print(f"             Created {len(merged_land_bounds)} land boundaries ({time.time()-t0:.1f}s)\n")
+
+    # t0 = time.time()
+    # print("[Final] Creating merged mesh object and writing to file...")
+    merged_mesh = Mesh(nodes=new_nodes_df, elements=elements_df, boundaries=merged_boundaries)
     # merged_mesh.nodes = merged_nodes
     # merged_mesh.elements = merged_ele
     # merged_mesh.boundaries = {'open': merged_open_bounds, 'land': merged_land_bounds}
@@ -817,7 +1230,7 @@ def create_netable_from_node_mapping(full_mesh, node_id_map_path='node_id_map.cs
             netable[idx] = 1
     return netable
 
-def mkeline(num_nodes, num_elements, nodes_per_element, netable):
+def mkeline(num_nodes, num_elements, nodes_per_element, netable, nbn_max):
     """Direct translation of Fortran mkeline subroutine.
     
     Finds boundary edges of the subgrid region by:
@@ -826,7 +1239,9 @@ def mkeline(num_nodes, num_elements, nodes_per_element, netable):
        element sharing that edge is also in the subgrid
     """
     import time
-    
+    print("Active elements:", np.sum(netable == 1))
+    print("Inactive elements:", np.sum(netable != 1))
+
     t_start = time.time()
     nm = nodes_per_element[['node_1', 'node_2', 'node_3']]
     # Convert to numpy array (0-indexed)
@@ -875,7 +1290,7 @@ def mkeline(num_nodes, num_elements, nodes_per_element, netable):
                 nblnc_list.append([n1, n2])
             
     
-    print(f"              mkeline: Found {nbl:,} boundary edges ({time.time()-t_start:.1f}s total)")
+    print(f"              mkeline: Found {len(nblnc_list),} boundary edges ({time.time()-t_start:.1f}s total)")
     
     nbl = len(nblnc_list)
     nblnc = np.array(nblnc_list).T
