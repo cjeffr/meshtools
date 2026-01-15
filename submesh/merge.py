@@ -342,8 +342,8 @@ def merge_domain(submesh, full_mesh, path='.', file_header='grid', savefile='mer
                 mmaps[n] = m
                 n += 1
     nd = mmaps[n-1] if n > 0 else 0  # Use n-1 since n was incremented
-    for i in range(n+1, len(submesh.elements)+1):
-        mmaps[i] = nd + i - n
+    for i in range(n, len(submesh.elements)):  # 0-indexed: n to len-1
+        mmaps[i] = nd + (i - n) + 1
     nen = len(submesh.elements)
     n = 0
     for m in range(num_elements):
